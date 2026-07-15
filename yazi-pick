@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# yazi-pick [開始ディレクトリ]: yaziでファイルを選び、最前面アプリのファイル選択ダイアログにパスを入力する
+# 使い方: ファイル選択ダイアログ(NSOpenPanel)が開いた状態でAeroSpaceのキーバインドから起動する
+# 引数で yazi の開始ディレクトリを指定できる (省略時は $HOME)
+set -u
+
+# ホットキーデーモン(AeroSpace等)からの起動はロケール未設定のことが多く、
+# UTF-8を明示しないとyaziがマルチバイトのパスを文字化けさせる
+export LANG=${LANG:-en_US.UTF-8}
+export LC_ALL=${LC_ALL:-$LANG}
+
+# ホットキーデーモンのPATHにはパッケージマネージャのbinが無いことが多いので、
+# 定番の設置場所もフォールバックとして探す (Homebrew / nix)
+YAZI=''
+for y in "$(command -v yazi 2>/dev/null)" /opt/homebrew/bin/yazi /usr/local/bin/yazi "/etc/profiles/per-user/$USER/bin/yazi"; do
+    if [ -n "$y" ] && [ -x "$y" ]; then
+        YAZI=$y
+        break
+    fi
+done
+if [ -z "$YAZI" ]; then
+    printf 'yazi-pick: yazi が見つかりません\n' >&2
+    exit 1
+fi
+LOG=${TMPDIR:-/tmp}/yazi-pick.log
+
+# ── ターミナル検出 ─────────────────────────────────────
+# 要件: 新規ウィンドウ(新規プロセス)でコマンドを実行し、終了までブロックできること。
+# YAZI_PICK_TERM=kitty|ghostty|wezterm|alacritty で明示指定できる (省略時は左から自動検出)。
+term_bin() { # $1=コマンド名 $2=.appバンドル名 → 実行ファイルパス
+    command -v "$1" 2>/dev/null && return 0
+    local p
+    for p in "/Applications/$2.app/Contents/MacOS/$1" "$HOME/Applications/$2.app/Contents/MacOS/$1"; do
+        if [ -x "$p" ]; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+term_name='' term=''
+for t in ${YAZI_PICK_TERM:-kitty ghostty wezterm alacritty}; do
+    case $t in
+        kitty) term=$(term_bin kitty kitty) || continue ;;
+        ghostty) term=$(term_bin ghostty Ghostty) || continue ;;
+        wezterm) term=$(term_bin wezterm WezTerm) || continue ;;
+        alacritty) term=$(term_bin alacritty Alacritty) || continue ;;
+        *)
+            printf 'yazi-pick: 未対応のターミナルです: %s\n' "$t" >&2
+            exit 1
+            ;;
+    esac
+    term_name=$t
+    break
+done
+if [ -z "$term_name" ]; then
+    printf 'yazi-pick: 対応ターミナルが見つかりません (kitty/ghostty/wezterm/alacritty)\n' >&2
+    exit 1
+fi
+
+# 新規ウィンドウで引数のコマンドを実行し、閉じるまでブロックする
+run_picker() {
+    case $term_name in
+        kitty)
+            "$term" --title yazi-picker \
+                -o remember_window_size=no \
+                -o initial_window_width=110c \
+                -o initial_window_height=30c \
+                "$@"
+            ;;
+        ghostty)
+            # Ghostty >= 1.2.0 (それ以前はCLI起動不可)。設定引数は -e より前に置く。
+            # abnormal-command-exit-runtime: yaziが即時異常終了したときウィンドウが残って
+            # ブロックし続けるのを防ぐ (macOSでは終了コード0でも250ms以内の終了は異常扱い)
+            "$term" --title=yazi-picker \
+                --window-width=110 --window-height=30 \
+                --quit-after-last-window-closed=true \
+                --abnormal-command-exit-runtime=1 \
+                -e "$@"
+            ;;
+        wezterm)
+            # --config はサブコマンドの前に置く必要がある。start にタイトル指定は無いため、
+            # initial_cols の評価式の副作用で format-window-title を登録して固定する。
+            # exit_behavior 等はユーザー設定で Hold になっていると閉じた後もブロックし続けるので上書き。
+            "$term" \
+                --config "initial_cols=(function() local wezterm = require('wezterm'); wezterm.on('format-window-title', function() return 'yazi-picker' end); return 110 end)()" \
+                --config initial_rows=30 \
+                --config 'exit_behavior="Close"' \
+                --config quit_when_all_windows_are_closed=true \
+                start --always-new-process -- "$@"
+            ;;
+        alacritty)
+            # -e は最後に置く必要がある。--title 指定で動的タイトル変更も抑止される
+            "$term" --title yazi-picker \
+                -o window.dimensions.columns=110 \
+                -o window.dimensions.lines=30 \
+                -e "$@"
+            ;;
+    esac
+}
+
+start_dir=${1:-$HOME}
+if [ ! -d "$start_dir" ]; then
+    printf 'yazi-pick: ディレクトリがありません: %s\n' "$start_dir" >&2
+    exit 1
+fi
+
+# 二重起動防止 (連打するとpicker同士・keystroke同士が競合して壊れる)
+LOCK=${TMPDIR:-/tmp}/yazi-pick.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+    oldpid=$(cat "$LOCK/pid" 2>/dev/null || true)
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+        exit 0
+    fi
+    # 前回が異常終了して残った古いロックは回収して続行
+fi
+printf '%s' $$ >"$LOCK/pid"
+
+chooser=$(mktemp)
+trap 'rm -f "$chooser"; rm -rf "$LOCK"' EXIT
+
+# 呼び出し元アプリ(ダイアログを出しているアプリ)を記録
+front=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true') || exit 1
+
+# yaziをターミナルの新規インスタンスで開き、閉じるまで待つ
+run_picker "$YAZI" "$start_dir" --chooser-file "$chooser"
+
+path=$(head -n1 "$chooser")
+
+# 何も選ばずに終了した場合は元のアプリに戻るだけ
+if [ -z "$path" ]; then
+    osascript -e 'on run argv
+        tell application "System Events" to set frontmost of process (item 1 of argv) to true
+    end run' "$front" 2>>"$LOG" || true
+    exit 0
+fi
+
+# ウィンドウサーバから見える対象プロセスのウィンドウ数。
+# Gecko系(zen等)はファイルダイアログ(リモートパネル)がAXツリーに一切現れないため、
+# CGとAXのウィンドウ数の差でダイアログの実在を検出する。
+cg_window_count() {
+    osascript -l JavaScript - "$1" <<'EOJ'
+ObjC.import('CoreGraphics');
+function run(argv) {
+    const pid = parseInt(argv[0], 10);
+    const info = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1, 0))) || []; // kCGWindowListOptionOnScreenOnly
+    return info.filter(w => w.kCGWindowOwnerPID === pid
+        && w.kCGWindowAlpha > 0
+        && w.kCGWindowBounds.Width >= 300
+        && w.kCGWindowBounds.Height >= 150).length;
+}
+EOJ
+}
+
+pid=$(osascript -e 'on run argv
+    tell application "System Events" to unix id of process (item 1 of argv)
+end run' "$front" 2>>"$LOG") || pid=""
+cgcount=0
+if [ -n "$pid" ]; then
+    cgcount=$(cg_window_count "$pid" 2>>"$LOG") || cgcount=0
+fi
+
+# 入力戦略:
+# 1. CGウィンドウ数 > AXウィンドウ数 → AX不可視のダイアログが実在 (Gecko系)。
+#    キーイベントだけの盲目モード (全選択→貼り付けなので残存テキストに連結されない)。
+# 2. それ以外は Cmd+Shift+G で「フォルダへ移動」シートを開き、「AXSheet の中にある
+#    新たにフォーカスされたテキスト欄」だけを対象に AX で直接書き込む。シート内で
+#    あることまで要求するので、ダイアログが無いのに別の欄 (ブラウザのページ内検索
+#    バー等) を掴んで誤入力することは構造的に起きない。
+# 3. 欄を確認できなければ ESC で後始末してエラー終了 (盲目モードには落ちない)。
+input_path() {
+    osascript - "$1" "$2" "$3" <<'EOS'
+on run argv
+    set frontApp to item 1 of argv
+    set thePath to item 2 of argv
+    set cgCount to (item 3 of argv) as integer
+    set axCount to 0
+    set goField to missing value
+    set preField to missing value
+
+    tell application "System Events"
+        tell process frontApp
+            -- ダイアログを出しているアプリが確実に前面に戻るまで待つ
+            repeat 50 times
+                set frontmost to true
+                if frontmost then exit repeat
+                delay 0.1
+            end repeat
+            if not frontmost then error frontApp & " が前面に来ない"
+            delay 0.2
+            set axCount to count of windows
+        end tell
+    end tell
+
+    -- AXに見えないダイアログ (Gecko系のリモートパネル) が実在する場合のみ盲目モード
+    if cgCount > axCount then
+        log "AX不可視ダイアログ: 盲目モードで入力 (front=" & frontApp & ")"
+        my blindInput(frontApp, thePath)
+        return
+    end if
+
+    tell application "System Events"
+        tell process frontApp
+            -- 保存ダイアログはファイル名欄に既にフォーカスがあるため、
+            -- シートの欄と区別できるよう現在のフォーカスを覚えておく
+            try
+                set fe to value of attribute "AXFocusedUIElement"
+                if my isTextInput(fe) then set preField to fe
+            end try
+
+            -- 「フォルダへ移動」シートを開き、シート内のテキスト欄にフォーカスが移るまで待つ
+            keystroke "g" using {command down, shift down}
+            repeat 20 times
+                try
+                    set fe to value of attribute "AXFocusedUIElement"
+                    if my isTextInput(fe) and my inSheet(fe) then
+                        set isNew to true
+                        if preField is not missing value then
+                            try
+                                if fe is preField then set isNew to false
+                            end try
+                        end if
+                        if isNew then
+                            set goField to fe
+                            exit repeat
+                        end if
+                    end if
+                end try
+                delay 0.1
+            end repeat
+
+            if goField is missing value then
+                key code 53 -- ESC: Cmd+Shift+Gで何か開いてしまっていた場合の後始末
+            end if
+        end tell
+    end tell
+
+    if goField is missing value then
+        error "移動シートを確認できない (ダイアログが開いていないか未対応アプリ)"
+    end if
+
+    tell application "System Events"
+        tell process frontApp
+            set value of goField to thePath
+            delay 0.1
+            if value of goField is not thePath then error "パスを書き込めない"
+            key code 36 -- 移動 (ファイルが選択された状態になる)
+
+            -- シートが閉じてフォーカスがファイル一覧に戻るまで待つ
+            repeat 50 times
+                try
+                    if not my isTextInput(value of attribute "AXFocusedUIElement") then exit repeat
+                on error
+                    exit repeat
+                end try
+                delay 0.1
+            end repeat
+            delay 0.2
+            key code 36 -- 「開く」を確定
+        end tell
+    end tell
+end run
+
+-- 盲目モード: ダイアログのAXが見えないアプリ向け。クリップボード経由で貼り付ける。
+-- 全選択してから貼るので、欄に残った前回パスに連結されることはない。
+on blindInput(frontApp, thePath)
+    set savedClip to ""
+    try
+        set savedClip to the clipboard as text
+    end try
+    set the clipboard to thePath
+    tell application "System Events"
+        tell process frontApp
+            keystroke "g" using {command down, shift down} -- 「フォルダへ移動」オーバーレイ
+            delay 0.6
+            keystroke "a" using {command down}
+            delay 0.15
+            keystroke "v" using {command down}
+            delay 0.4
+            key code 36 -- 移動
+            delay 0.8
+            key code 36 -- 「開く」を確定
+        end tell
+    end tell
+    delay 0.2
+    try
+        set the clipboard to savedClip
+    end try
+end blindInput
+
+-- 「フォルダへ移動」の欄は AXSheet の直下にある (AXTextField <- AXSheet <- AXWindow)
+on inSheet(el)
+    tell application "System Events"
+        set cur to el
+        repeat 12 times
+            try
+                set cur to value of attribute "AXParent" of cur
+                set r to role of cur
+                if r is "AXSheet" then return true
+                if r is "AXWindow" or r is "AXApplication" then return false
+            on error
+                return false
+            end try
+        end repeat
+        return false
+    end tell
+end inSheet
+
+on isTextInput(el)
+    tell application "System Events"
+        set r to role of el
+        return r is "AXTextField" or r is "AXComboBox"
+    end tell
+end isTextInput
+EOS
+}
+
+if ! input_path "$front" "$path" "$cgcount" 2>>"$LOG"; then
+    printf '[%s] 入力失敗 front=%s path=%s cgcount=%s\n' "$(date '+%F %T')" "$front" "$path" "$cgcount" >>"$LOG"
+fi
