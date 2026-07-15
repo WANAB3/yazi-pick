@@ -1,20 +1,22 @@
 # yazi-pick
 
-Pick files with [yazi](https://github.com/sxyazi/yazi) in macOS file dialogs: press a hotkey while a file open dialog (NSOpenPanel) is in front, choose a file in yazi running in a new terminal window, and the path is typed into the dialog automatically.
+**English | [日本語](README.ja.md)**
 
-macOS のファイル選択ダイアログを yazi で操作するスクリプト。「開く」「ファイルのアップロード」等のダイアログが最前面の状態でホットキーから起動すると、ターミナルの新規ウィンドウに yazi が開き、選んだファイルのパスがダイアログに自動入力されて「開く」まで確定される。
+Pick files with [yazi](https://github.com/sxyazi/yazi) in macOS file dialogs: press a hotkey while a file open dialog (NSOpenPanel) is in front, choose a file in yazi running in a new terminal window, and the path is typed into the dialog automatically — all the way through confirming "Open".
 
-## 必要なもの
+Think of it as the macOS counterpart of [xdg-desktop-portal-termfilechooser](https://yazi-rs.github.io/docs/tips#file-chooser) on Linux.
+
+## Requirements
 
 - macOS
 - [yazi](https://github.com/sxyazi/yazi)
-- ターミナル: **kitty / Ghostty (>= 1.2.0) / WezTerm / Alacritty** のいずれか。
-  この順で自動検出する。`YAZI_PICK_TERM=wezterm` のように環境変数で明示指定も可能。
-- 起動用のホットキーツール (AeroSpace / skhd / Raycast / Hammerspoon など何でも)
+- A terminal: **kitty / Ghostty (>= 1.2.0) / WezTerm / Alacritty**.
+  Autodetected in that order; force one with `YAZI_PICK_TERM=wezterm` etc.
+- Any hotkey launcher (AeroSpace / skhd / Raycast / Hammerspoon / ...)
 
-**特定のウィンドウマネージャには依存しない。** 必要なのは「ダイアログが最前面の状態でこのスクリプトを起動する手段」だけ。
+**No window-manager dependency.** All you need is a way to run this script while a file dialog is frontmost.
 
-## インストール
+## Install
 
 ```sh
 mkdir -p ~/.local/bin
@@ -22,14 +24,14 @@ curl -fsSL https://raw.githubusercontent.com/WANAB3/yazi-pick/main/yazi-pick -o 
 chmod +x ~/.local/bin/yazi-pick
 ```
 
-ホットキーの設定例:
+Hotkey examples:
 
 **AeroSpace** (`~/.config/aerospace/aerospace.toml`):
 
 ```toml
 alt-o = 'exec-and-forget ~/.local/bin/yazi-pick'
 
-# picker のウィンドウをフローティングで出す (任意)
+# Float the picker window (optional)
 [[on-window-detected]]
 if.window-title-regex-substring = 'yazi-picker'
 run = 'layout floating'
@@ -41,46 +43,48 @@ run = 'layout floating'
 alt - o : ~/.local/bin/yazi-pick
 ```
 
-初回実行時、ホットキーツールに**アクセシビリティ権限**が必要
-(システム設定 → プライバシーとセキュリティ → アクセシビリティ)。
-キーストローク送信と AX 操作に使う。
+On first use, grant your hotkey tool **Accessibility permission**
+(System Settings → Privacy & Security → Accessibility). It is needed for
+sending keystrokes and driving the dialog via the Accessibility API.
 
-## 使い方
+## Usage
 
-1. アプリのファイル選択ダイアログを開く
-2. ホットキーで yazi-pick を起動
-3. yazi でファイルを選んで Enter
-4. パスがダイアログに自動入力される
+1. Open a file dialog (Open / Upload / ...) in any app
+2. Trigger yazi-pick with your hotkey
+3. Pick a file in yazi and hit Enter
+4. The path is filled into the dialog and confirmed
 
-引数で yazi の開始ディレクトリを指定できる (省略時は `$HOME`):
+An optional argument sets yazi's starting directory (defaults to `$HOME`):
 
 ```sh
 yazi-pick ~/Downloads
 ```
 
-## 仕組み
+## How it works
 
-1. ダイアログを出しているアプリを記録し、ターミナルの新規ウィンドウで
-   `yazi --chooser-file` を実行、閉じるまで待つ
-2. 選ばれたパスをダイアログに入力する。アプリによって戦略を変える:
-   - **通常 (AppKit アプリ)**: Cmd+Shift+G の「フォルダへ移動」シートを開き、
-     「AXSheet 内の新たにフォーカスされたテキスト欄」だけを対象に
-     アクセシビリティ API で直接書き込む。書き込み結果を読み戻して検証してから
-     確定するので、IME・日本語パス・欄に残った前回パスの影響を受けない。
-   - **Firefox 系ブラウザ (Zen 等)**: ファイルダイアログがどのプロセスの
-     AX ツリーにも現れない (リモートパネル)。ウィンドウサーバから見える
-     ウィンドウ数と AX のウィンドウ数の差でダイアログの実在を確認した上で、
-     キーイベントだけで入力する (全選択→貼り付けなので連結事故は起きない)。
-   - **ダイアログの実在を確認できない場合**: 何も入力せずエラー終了する。
-     アプリに勝手にキー入力が流れることはない。
-3. 失敗は `$TMPDIR/yazi-pick.log` に記録される
+1. Remembers the app showing the dialog, then runs `yazi --chooser-file` in a
+   new terminal window and waits for it to close.
+2. Types the chosen path into the dialog, with a per-app strategy:
+   - **Regular (AppKit) apps**: opens the Go-to-Folder sheet (Cmd+Shift+G) and
+     writes the path via the Accessibility API — but only into a *newly focused
+     text field inside an AXSheet*, and verifies the write by reading it back
+     before confirming. Immune to IME state, multibyte paths, and leftover text
+     in the field.
+   - **Firefox-family browsers (Zen etc.)**: their file dialogs are remote
+     panels that never appear in *any* process's accessibility tree. The script
+     proves the dialog exists by diffing the window-server window count against
+     the accessibility window count, then drives it with plain keystrokes
+     (select-all before paste, so nothing can be concatenated).
+   - **No dialog detected**: exits with an error without sending any input.
+     Keystrokes are never sprayed into an unsuspecting app.
+3. Failures are logged to `$TMPDIR/yazi-pick.log`.
 
-## トラブルシューティング
+## Troubleshooting
 
-- 動かないときはまず `cat "$TMPDIR/yazi-pick.log"`
-- `対応ターミナルが見つかりません` → 対応ターミナルを入れるか、
-  PATH の通った場所か `/Applications` に配置する
-- 何も起きない → ホットキーツールのアクセシビリティ権限を確認
+- First stop: `cat "$TMPDIR/yazi-pick.log"`
+- `no supported terminal found` → install one of the supported terminals, or
+  put it on PATH / in `/Applications`
+- Nothing happens → check the Accessibility permission of your hotkey tool
 
 ## License
 
