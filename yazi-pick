@@ -65,6 +65,8 @@ fi
 run_picker() {
     case $term_name in
         kitty)
+            # One-shot instance: measured at ~0.5s for the full window lifecycle,
+            # so a resident instance isn't worth the extra failure modes.
             "$term" --title yazi-picker \
                 -o remember_window_size=no \
                 -o initial_window_width=110c \
@@ -142,31 +144,34 @@ if [ -z "$path" ]; then
     exit 0
 fi
 
-# Number of this process's windows as seen by the window server. Gecko-based
-# browsers (Zen etc.) host their file dialogs as remote panels that never
-# appear in ANY process's AX tree, so the difference between CG and AX window
-# counts is our proof that such a dialog actually exists.
-cg_window_count() {
+# Number of the front app's windows as seen by the window server, resolved from
+# the process name. Gecko-based browsers (Zen etc.) host their file dialogs as
+# remote panels that never appear in ANY process's AX tree, so the difference
+# between CG and AX window counts is our proof that such a dialog actually
+# exists. Runs in the background while input_path restores focus; the
+# AppleScript picks the result up from a file, so this costs no extra latency.
+probe_cg_count() {
     osascript -l JavaScript - "$1" <<'EOJ'
 ObjC.import('CoreGraphics');
 function run(argv) {
-    const pid = parseInt(argv[0], 10);
+    let pid;
+    try {
+        pid = Application('System Events').processes.byName(argv[0]).unixId();
+    } catch (e) {
+        return '0';
+    }
     const info = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1, 0))) || []; // kCGWindowListOptionOnScreenOnly
-    return info.filter(w => w.kCGWindowOwnerPID === pid
+    return String(info.filter(w => w.kCGWindowOwnerPID === pid
         && w.kCGWindowAlpha > 0
         && w.kCGWindowBounds.Width >= 300
-        && w.kCGWindowBounds.Height >= 150).length;
+        && w.kCGWindowBounds.Height >= 150).length);
 }
 EOJ
 }
 
-pid=$(osascript -e 'on run argv
-    tell application "System Events" to unix id of process (item 1 of argv)
-end run' "$front" 2>>"$LOG") || pid=""
-cgcount=0
-if [ -n "$pid" ]; then
-    cgcount=$(cg_window_count "$pid" 2>>"$LOG") || cgcount=0
-fi
+cgfile=$(mktemp)
+trap 'rm -f "$chooser" "$cgfile"; rm -rf "$LOCK"' EXIT
+probe_cg_count "$front" >"$cgfile" 2>>"$LOG" &
 
 # Input strategy:
 # 1. CG window count > AX window count → an AX-invisible dialog really exists
@@ -183,7 +188,7 @@ input_path() {
 on run argv
     set frontApp to item 1 of argv
     set thePath to item 2 of argv
-    set cgCount to (item 3 of argv) as integer
+    set cgFile to item 3 of argv
     set axCount to 0
     set goField to missing value
     set preField to missing value
@@ -201,6 +206,20 @@ on run argv
             set axCount to count of windows
         end tell
     end tell
+
+    -- The CG-count probe was started in parallel by the caller; by now it has
+    -- had the whole focus-restore phase to finish. Pick up its result.
+    set cgCount to 0
+    repeat 15 times
+        try
+            set raw to do shell script "cat " & quoted form of cgFile
+            if raw is not "" then
+                set cgCount to raw as integer
+                exit repeat
+            end if
+        end try
+        delay 0.1
+    end repeat
 
     -- Blind mode only when an AX-invisible dialog (Gecko remote panel) exists
     if cgCount > axCount then
@@ -282,13 +301,13 @@ on blindInput(frontApp, thePath)
     tell application "System Events"
         tell process frontApp
             keystroke "g" using {command down, shift down} -- Go-to-Folder overlay
-            delay 0.6
+            delay 0.5
             keystroke "a" using {command down}
-            delay 0.15
+            delay 0.1
             keystroke "v" using {command down}
-            delay 0.4
+            delay 0.3
             key code 36 -- Go
-            delay 0.8
+            delay 0.6
             key code 36 -- confirm "Open"
         end tell
     end tell
@@ -326,6 +345,6 @@ end isTextInput
 EOS
 }
 
-if ! input_path "$front" "$path" "$cgcount" 2>>"$LOG"; then
-    printf '[%s] input failed front=%s path=%s cgcount=%s\n' "$(date '+%F %T')" "$front" "$path" "$cgcount" >>"$LOG"
+if ! input_path "$front" "$path" "$cgfile" 2>>"$LOG"; then
+    printf '[%s] input failed front=%s path=%s cgcount=%s\n' "$(date '+%F %T')" "$front" "$path" "$(cat "$cgfile" 2>/dev/null)" >>"$LOG"
 fi
