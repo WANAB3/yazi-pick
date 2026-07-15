@@ -2,7 +2,7 @@
 
 **English | [日本語](README.ja.md)**
 
-Pick files with [yazi](https://github.com/sxyazi/yazi) in macOS file dialogs: press a hotkey while a file open dialog (NSOpenPanel) is in front, choose a file in yazi running in a new terminal window, and the path is typed into the dialog automatically — all the way through confirming "Open".
+Pick files with [yazi](https://github.com/sxyazi/yazi) in macOS file dialogs: press a hotkey while a file open dialog (NSOpenPanel) is in front, choose a file in yazi running in a floating terminal panel, and the path is typed into the dialog automatically — all the way through confirming "Open".
 
 Think of it as the macOS counterpart of [xdg-desktop-portal-termfilechooser](https://yazi-rs.github.io/docs/tips#file-chooser) on Linux.
 
@@ -13,6 +13,8 @@ Think of it as the macOS counterpart of [xdg-desktop-portal-termfilechooser](htt
 - A terminal: **kitty / Ghostty (>= 1.2.0) / WezTerm / Alacritty**.
   Autodetected in that order; force one with `YAZI_PICK_TERM=wezterm` etc.
 - Any hotkey launcher (AeroSpace / skhd / Raycast / Hammerspoon / ...)
+- Optional, for the fast native input path: Rust (`cargo`) to build the
+  bundled helper
 
 **No window-manager dependency.** All you need is a way to run this script while a file dialog is frontmost.
 
@@ -24,17 +26,20 @@ curl -fsSL https://raw.githubusercontent.com/WANAB3/yazi-pick/main/yazi-pick -o 
 chmod +x ~/.local/bin/yazi-pick
 ```
 
+Optional but recommended — build the native helper (see [Speed](#speed)):
+
+```sh
+git clone https://github.com/WANAB3/yazi-pick.git && cd yazi-pick/helper
+cargo build --release
+cp target/release/yazi-pick-ax ~/.local/bin/
+```
+
 Hotkey examples:
 
 **AeroSpace** (`~/.config/aerospace/aerospace.toml`):
 
 ```toml
 alt-o = 'exec-and-forget ~/.local/bin/yazi-pick'
-
-# Float the picker window (optional)
-[[on-window-detected]]
-if.window-title-regex-substring = 'yazi-picker'
-run = 'layout floating'
 ```
 
 **skhd**:
@@ -60,21 +65,41 @@ An optional argument sets yazi's starting directory (defaults to `$HOME`):
 yazi-pick ~/Downloads
 ```
 
+## Speed
+
+Two independent fast paths. Both are optional and degrade gracefully;
+with both active (kitty + built helper), measured on an M4:
+**hotkey → picker ~0.2s, pick → dialog confirmed ~1.4-1.7s**.
+
+- **Resident picker instance (kitty only, automatic)**: the first run spawns a
+  hidden windowless kitty instance; picker windows are then served over its
+  socket and appear in ~0.2s instead of a ~0.5-0.7s cold start. The panel is
+  borderless, translucent and centered, Spotlight-style. It never appears in
+  the Dock or Cmd-Tab. Kill it anytime with `pkill -f yazi-pickd`; the next
+  run respawns it (or falls back to one-shot windows if it can't).
+- **Native helper (`yazi-pick-ax`)**: drives the dialog through the
+  Accessibility C API in-process. The osascript fallback pays 50-150ms of
+  Apple Events IPC per UI query; the helper pays microseconds, which cuts
+  post-pick latency from ~2.5s to ~1.4-1.7s. Install it next to the script
+  (see above); the script picks it up automatically.
+
 ## How it works
 
-1. Remembers the app showing the dialog, then runs `yazi --chooser-file` in a
-   new terminal window and waits for it to close.
+1. Remembers the app showing the dialog (and which of its windows is key),
+   then runs `yazi --chooser-file` in a terminal panel and waits for it to
+   close.
 2. Types the chosen path into the dialog, with a per-app strategy:
-   - **Regular (AppKit) apps**: opens the Go-to-Folder sheet (Cmd+Shift+G) and
-     writes the path via the Accessibility API — but only into a *newly focused
-     text field inside an AXSheet*, and verifies the write by reading it back
-     before confirming. Immune to IME state, multibyte paths, and leftover text
-     in the field.
+   - **Regular (AppKit) apps**: re-raises the dialog window (macOS may hand
+     focus back to a document window instead), opens the Go-to-Folder sheet
+     (Cmd+Shift+G) and writes the path via the Accessibility API — but only
+     into a *newly focused text field inside an AXSheet*, verifying the write
+     by reading it back before confirming. Immune to IME state, multibyte
+     paths, and leftover text in the field.
    - **Firefox-family browsers (Zen etc.)**: their file dialogs are remote
-     panels that never appear in *any* process's accessibility tree. The script
-     proves the dialog exists by diffing the window-server window count against
-     the accessibility window count, then drives it with plain keystrokes
-     (select-all before paste, so nothing can be concatenated).
+     panels that never appear in *any* process's accessibility tree. The
+     script proves the dialog exists by diffing the window-server window count
+     against the accessibility window count, then drives it with plain
+     keystrokes (select-all before paste, so nothing can be concatenated).
    - **No dialog detected**: exits with an error without sending any input.
      Keystrokes are never sprayed into an unsuspecting app.
 3. Failures are logged to `$TMPDIR/yazi-pick.log`.
@@ -85,6 +110,7 @@ yazi-pick ~/Downloads
 - `no supported terminal found` → install one of the supported terminals, or
   put it on PATH / in `/Applications`
 - Nothing happens → check the Accessibility permission of your hotkey tool
+- Weird picker window state → `pkill -f yazi-pickd` and retry
 
 ## License
 

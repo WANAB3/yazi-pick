@@ -3,6 +3,13 @@
 # frontmost app's file open dialog (NSOpenPanel).
 # Usage: invoke from a hotkey while a file dialog is in front.
 # An optional argument sets yazi's starting directory (defaults to $HOME).
+#
+# Fast path (both optional, both degrade gracefully):
+#   - kitty: a hidden resident instance serves picker windows over a socket,
+#     so the panel appears in ~0.1s instead of a ~0.7s cold start.
+#   - yazi-pick-ax: a small native helper that drives the dialog through the
+#     Accessibility API in-process (osascript needs ~50-150ms of Apple Events
+#     IPC per query). Build it from helper/ and put it next to this script.
 set -u
 
 # Hotkey daemons (AeroSpace etc.) often launch us without a locale; without
@@ -24,6 +31,16 @@ if [ -z "$YAZI" ]; then
     exit 1
 fi
 LOG=${TMPDIR:-/tmp}/yazi-pick.log
+PICKD_SOCK=${TMPDIR:-/tmp}/yazi-pickd.sock
+
+# Native AX helper (optional): same directory as this script, then PATH.
+HELPER=''
+for h in "$(dirname "$0")/yazi-pick-ax" "$(command -v yazi-pick-ax 2>/dev/null)"; do
+    if [ -n "$h" ] && [ -x "$h" ]; then
+        HELPER=$h
+        break
+    fi
+done
 
 # ── Terminal detection ─────────────────────────────────────
 # Requirement: run a command in a new window (new process) and block until
@@ -61,12 +78,74 @@ if [ -z "$term_name" ]; then
     exit 1
 fi
 
+# ── kitty resident daemon ──────────────────────────────────
+# A windowless kitty instance (accessory app: hidden from Dock and Cmd-Tab)
+# holds the GPU/font state, so creating a picker window over its socket takes
+# ~0.1s. The instance is styled once at spawn: borderless translucent panel.
+KITTEN=''
+if [ "$term_name" = kitty ]; then
+    KITTEN=$(dirname "$term")/kitten
+    [ -x "$KITTEN" ] || KITTEN=$(command -v kitten 2>/dev/null) || KITTEN=''
+fi
+
+pickd_ensure() {
+    "$KITTEN" @ --to "unix:$PICKD_SOCK" ls >/dev/null 2>&1 && return 0
+    rm -f "$PICKD_SOCK"
+    "$term" --detach --listen-on "unix:$PICKD_SOCK" \
+        -o allow_remote_control=socket-only \
+        -o macos_quit_when_last_window_closed=no \
+        -o macos_hide_from_tasks=yes \
+        -o hide_window_decorations=titlebar-only \
+        -o window_padding_width=10 \
+        -o background_opacity=0.94 -o background_blur=40 \
+        -o remember_window_size=no \
+        -o initial_window_width=110c -o initial_window_height=30c \
+        --start-as=minimized --title yazi-pickd \
+        /bin/sh -c 'exec sleep 2147483647' || return 1
+    local i
+    for i in $(seq 1 100); do
+        "$KITTEN" @ --to "unix:$PICKD_SOCK" ls >/dev/null 2>&1 && break
+        sleep 0.05
+    done
+    "$KITTEN" @ --to "unix:$PICKD_SOCK" ls >/dev/null 2>&1 || return 1
+    # The bootstrap window has served its purpose; the instance stays alive
+    # without any windows because macos_quit_when_last_window_closed=no.
+    "$KITTEN" @ --to "unix:$PICKD_SOCK" close-window --match all >/dev/null 2>&1 || true
+}
+
+# Run yazi in a window of the resident instance and block until it closes.
+run_picker_kitty() {
+    [ -n "$KITTEN" ] || return 1
+    pickd_ensure || return 1
+    local wid dpid
+    wid=$("$KITTEN" @ --to "unix:$PICKD_SOCK" launch --type=os-window \
+        --os-window-title yazi-picker -- "$@") || return 1
+    "$KITTEN" @ --to "unix:$PICKD_SOCK" focus-window --match "id:$wid" >/dev/null 2>&1 || true
+    # An accessory app's new window does not take keyboard focus by itself;
+    # activate the instance explicitly (and center the panel, Spotlight-style).
+    dpid=$(pgrep -f "listen-on unix:$PICKD_SOCK" | head -1)
+    if [ -n "$dpid" ]; then
+        if [ -n "$HELPER" ]; then
+            "$HELPER" activate "$dpid" 2>>"$LOG" || true
+            "$HELPER" center "$dpid" 2>>"$LOG" || true
+        else
+            osascript -e 'on run argv
+                tell application "System Events" to set frontmost of (first application process whose unix id is (item 1 of argv as integer)) to true
+            end run' "$dpid" 2>>"$LOG" || true
+        fi
+    fi
+    while "$KITTEN" @ --to "unix:$PICKD_SOCK" ls --match "id:$wid" >/dev/null 2>&1; do
+        sleep 0.05
+    done
+}
+
 # Run the given command in a new window and block until it closes.
 run_picker() {
     case $term_name in
         kitty)
-            # One-shot instance: measured at ~0.5s for the full window lifecycle,
-            # so a resident instance isn't worth the extra failure modes.
+            # Fast path via the resident instance; fall back to a one-shot
+            # instance (~0.5s full lifecycle) if the daemon cannot be reached.
+            run_picker_kitty "$@" && return 0
             "$term" --title yazi-picker \
                 -o remember_window_size=no \
                 -o initial_window_width=110c \
@@ -128,22 +207,51 @@ printf '%s' $$ >"$LOCK/pid"
 chooser=$(mktemp)
 trap 'rm -f "$chooser"; rm -rf "$LOCK"' EXIT
 
-# Remember the app showing the dialog (the frontmost app).
-front=$(osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true') || exit 1
+# Remember the app showing the dialog (the frontmost app) and the title of its
+# focused window (the dialog itself; reactivating the app after the picker may
+# hand key status to a different window, so the dialog must be re-raised).
+front_pid='' front='' front_win=''
+if [ -n "$HELPER" ]; then
+    IFS=$'\t' read -r front_pid front front_win < <("$HELPER" frontmost 2>>"$LOG") || true
+fi
+if [ -z "$front_pid" ]; then
+    IFS=$'\t' read -r front front_win < <(osascript -e '
+        tell application "System Events"
+            set p to first application process whose frontmost is true
+            set wname to ""
+            try
+                set wname to name of value of attribute "AXFocusedWindow" of p
+            end try
+            return (name of p) & tab & wname
+        end tell') || exit 1
+fi
 
-# Open yazi in a new terminal instance and wait until it closes.
+# Open yazi in a terminal window and wait until it closes.
 run_picker "$YAZI" "$start_dir" --chooser-file "$chooser"
 
 path=$(head -n1 "$chooser")
 
 # Nothing selected: just give focus back to the original app.
 if [ -z "$path" ]; then
-    osascript -e 'on run argv
-        tell application "System Events" to set frontmost of process (item 1 of argv) to true
-    end run' "$front" 2>>"$LOG" || true
+    if [ -n "$HELPER" ] && [ -n "$front_pid" ]; then
+        "$HELPER" activate "$front_pid" 2>>"$LOG" || true
+    else
+        osascript -e 'on run argv
+            tell application "System Events" to set frontmost of process (item 1 of argv) to true
+        end run' "$front" 2>>"$LOG" || true
+    fi
     exit 0
 fi
 
+# ── Fast path: native helper ───────────────────────────────
+if [ -n "$HELPER" ] && [ -n "$front_pid" ]; then
+    if ! "$HELPER" push "$front_pid" "$path" "$front_win" 2>>"$LOG"; then
+        printf '[%s] input failed front=%s(%s) path=%s\n' "$(date '+%F %T')" "$front" "$front_pid" "$path" >>"$LOG"
+    fi
+    exit 0
+fi
+
+# ── Fallback: osascript ────────────────────────────────────
 # Number of the front app's windows as seen by the window server, resolved from
 # the process name. Gecko-based browsers (Zen etc.) host their file dialogs as
 # remote panels that never appear in ANY process's AX tree, so the difference
@@ -173,7 +281,7 @@ cgfile=$(mktemp)
 trap 'rm -f "$chooser" "$cgfile"; rm -rf "$LOCK"' EXIT
 probe_cg_count "$front" >"$cgfile" 2>>"$LOG" &
 
-# Input strategy:
+# Input strategy (mirrored by the native helper):
 # 1. CG window count > AX window count → an AX-invisible dialog really exists
 #    (Gecko). Use blind keystroke mode (select-all then paste, so leftover text
 #    in the field can never be concatenated with the path).
@@ -184,11 +292,12 @@ probe_cg_count "$front" >"$cgfile" 2>>"$LOG" &
 # 3. If no such field shows up, press ESC to clean up and fail. We never fall
 #    back to blind typing here.
 input_path() {
-    osascript - "$1" "$2" "$3" <<'EOS'
+    osascript - "$1" "$2" "$3" "$4" <<'EOS'
 on run argv
     set frontApp to item 1 of argv
     set thePath to item 2 of argv
     set cgFile to item 3 of argv
+    set frontWin to item 4 of argv
     set axCount to 0
     set goField to missing value
     set preField to missing value
@@ -230,6 +339,14 @@ on run argv
 
     tell application "System Events"
         tell process frontApp
+            -- Reactivation may have keyed the document window instead of the
+            -- dialog; re-raise the window that was focused at pick start
+            if frontWin is not "" then
+                try
+                    perform action "AXRaise" of (first window whose name is frontWin)
+                    delay 0.15
+                end try
+            end if
             -- Save dialogs focus the filename field from the start; remember it
             -- so we can tell it apart from the Go-to-Folder sheet's field
             try
@@ -345,6 +462,6 @@ end isTextInput
 EOS
 }
 
-if ! input_path "$front" "$path" "$cgfile" 2>>"$LOG"; then
+if ! input_path "$front" "$path" "$cgfile" "$front_win" 2>>"$LOG"; then
     printf '[%s] input failed front=%s path=%s cgcount=%s\n' "$(date '+%F %T')" "$front" "$path" "$(cat "$cgfile" 2>/dev/null)" >>"$LOG"
 fi

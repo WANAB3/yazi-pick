@@ -1,0 +1,7 @@
+# This tool is macOS-only. Always link with Apple clang so the build works
+# even when a non-Apple toolchain (e.g. nix gcc) shadows `cc` on PATH.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/clang"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/clang"

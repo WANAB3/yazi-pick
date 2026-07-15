@@ -1,0 +1,16 @@
+[package]
+name = "yazi-pick-ax"
+version = "0.1.0"
+edition = "2021"
+description = "Native accessibility helper for yazi-pick: types a path into the frontmost macOS file dialog"
+license = "MIT"
+
+[dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"
+objc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
