@@ -67,16 +67,13 @@ yazi-pick ~/Downloads
 
 ## Speed
 
-Two independent fast paths. Both are optional and degrade gracefully;
-with both active (kitty + built helper), measured on an M4:
-**hotkey → picker ~0.2s, pick → dialog confirmed ~1.4-1.7s**.
+With the native helper built, measured on an M4:
+**hotkey → picker ~0.5s, pick → dialog confirmed ~1.4-1.7s**.
 
-- **Resident picker instance (kitty only, automatic)**: the first run spawns a
-  hidden windowless kitty instance; picker windows are then served over its
-  socket and appear in ~0.2s instead of a ~0.5-0.7s cold start. The panel is
-  borderless, translucent and centered, Spotlight-style. It never appears in
-  the Dock or Cmd-Tab. Kill it anytime with `pkill -f yazi-pickd`; the next
-  run respawns it (or falls back to one-shot windows if it can't).
+Each picker is a fresh one-shot terminal instance — nothing stays resident.
+The kitty window is styled as a borderless, translucent, centered panel,
+Spotlight-style.
+
 - **Native helper (`yazi-pick-ax`)**: drives the dialog through the
   Accessibility C API in-process. The osascript fallback pays 50-150ms of
   Apple Events IPC per UI query; the helper pays microseconds, which cuts
@@ -110,7 +107,6 @@ with both active (kitty + built helper), measured on an M4:
 - `no supported terminal found` → install one of the supported terminals, or
   put it on PATH / in `/Applications`
 - Nothing happens → check the Accessibility permission of your hotkey tool
-- Weird picker window state → `pkill -f yazi-pickd` and retry
 
 ## License
 
