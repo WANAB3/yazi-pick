@@ -19,13 +19,25 @@ Linux の [xdg-desktop-portal-termfilechooser](https://yazi-rs.github.io/docs/ti
 
 ## インストール
 
+2 つのバージョンがある。スクリプトも機能も同じで、違いは選んだパスを
+ダイアログに入力する方法だけ:
+
+| | セットアップ | 選択後の入力 | 追加要件 |
+|---|---|---|---|
+| **Basic** | シェルスクリプト 1 本 | osascript・~2.5s | なし |
+| **Fast** | + ネイティブヘルパをビルド | Accessibility API・~1.4-1.7s | Rust (`cargo`) |
+
+まず Basic で始め、あとからヘルパを置けば自動で使われる (→[高速化](#高速化))。
+
+### Basic
+
 ```sh
 mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/WANAB3/yazi-pick/main/yazi-pick -o ~/.local/bin/yazi-pick
 chmod +x ~/.local/bin/yazi-pick
 ```
 
-任意だが推奨 — ネイティブヘルパのビルド ([高速化](#高速化)参照):
+### Fast — ネイティブヘルパを追加
 
 ```sh
 git clone https://github.com/WANAB3/yazi-pick.git && cd yazi-pick/helper

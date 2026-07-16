@@ -20,13 +20,26 @@ Think of it as the macOS counterpart of [xdg-desktop-portal-termfilechooser](htt
 
 ## Install
 
+yazi-pick comes in two versions — same script, same features. The only
+difference is how the picked path is typed into the dialog:
+
+| | Setup | Post-pick input | Extra requirement |
+|---|---|---|---|
+| **Basic** | copy one shell script | osascript, ~2.5s | none |
+| **Fast** | + build the native helper | Accessibility API, ~1.4-1.7s | Rust (`cargo`) |
+
+Start with Basic; drop in the helper anytime and the script picks it up
+automatically (see [Speed](#speed)).
+
+### Basic
+
 ```sh
 mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/WANAB3/yazi-pick/main/yazi-pick -o ~/.local/bin/yazi-pick
 chmod +x ~/.local/bin/yazi-pick
 ```
 
-Optional but recommended — build the native helper (see [Speed](#speed)):
+### Fast — add the native helper
 
 ```sh
 git clone https://github.com/WANAB3/yazi-pick.git && cd yazi-pick/helper
